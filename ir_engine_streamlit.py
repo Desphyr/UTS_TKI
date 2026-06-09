@@ -3,6 +3,7 @@ import logging
 import math
 import re
 import os
+import atexit
 from collections import defaultdict
 from typing import Dict, List, Tuple, Set
 
@@ -28,6 +29,7 @@ except ImportError:
 DOCUMENTS_FILE = "documents.json"
 INVERTED_INDEX_FILE = "inverted_index.json"
 DOC_VECTORS_FILE = "doc_vectors.json"
+MAX_CACHED_DOCUMENTS = 50  # Maksimal dokumen yang disimpan
 
 INDONESIAN_STOPWORDS = {
     'yang', 'dan', 'di', 'dari', 'ke', 'adalah', 'ini', 'itu', 'atau', 'tidak',
@@ -78,8 +80,21 @@ class InvertedIndex:
         self.documents: Dict[int, str] = {}
         self.doc_vectors: Dict[int, Dict[str, float]] = {}
         self.vocabulary: Set[str] = set()
+        self.doc_id_counter = 0
 
     def add_document(self, doc_id: int, doc_content: str) -> None:
+        # Enforce limit maksimal dokumen (FIFO - buang dokumen tertua)
+        if len(self.documents) >= MAX_CACHED_DOCUMENTS and doc_id not in self.documents:
+            oldest_id = min(self.documents.keys())
+            del self.documents[oldest_id]
+            for term in list(self.index.keys()):
+                if oldest_id in self.index[term]:
+                    del self.index[term][oldest_id]
+                if not self.index[term]:
+                    del self.index[term]
+            if oldest_id in self.doc_vectors:
+                del self.doc_vectors[oldest_id]
+        
         self.documents[doc_id] = doc_content
         tokens = preprocess_text(doc_content)
         tf_dict = defaultdict(int)
@@ -126,32 +141,62 @@ class InvertedIndex:
         with open(DOC_VECTORS_FILE, 'w', encoding='utf-8') as f:
             json.dump(self.doc_vectors, f, ensure_ascii=False, indent=2)
 
+    def clear_index(self):
+        """Kosongkan semua dokumen dan index"""
+        self.documents.clear()
+        self.index.clear()
+        self.doc_vectors.clear()
+        self.vocabulary.clear()
+        self.doc_id_counter = 0
+
     def load_from_disk(self):
         if not os.path.exists(DOCUMENTS_FILE):
             return
         with open(DOCUMENTS_FILE, 'r', encoding='utf-8') as f:
-            self.documents = {int(k): v for k, v in json.load(f).items()}
+            all_docs = {int(k): v for k, v in json.load(f).items()}
+        
+        # Hanya load 50 dokumen terakhir (berdasarkan ID)
+        if len(all_docs) > MAX_CACHED_DOCUMENTS:
+            sorted_ids = sorted(all_docs.keys(), reverse=True)[:MAX_CACHED_DOCUMENTS]
+            self.documents = {doc_id: all_docs[doc_id] for doc_id in sorted_ids}
+        else:
+            self.documents = all_docs
+        
+        # Load index jika ada
         if os.path.exists(INVERTED_INDEX_FILE):
             with open(INVERTED_INDEX_FILE, 'r', encoding='utf-8') as f:
                 index_dict = json.load(f)
                 for term, docs in index_dict.items():
-                    self.index[term] = defaultdict(int, {int(k): v for k, v in docs.items()})
-                    self.vocabulary.add(term)
-        else:
+                    # Filter hanya dokumen yang di-load
+                    filtered_docs = {int(k): v for k, v in docs.items() if int(k) in self.documents}
+                    if filtered_docs:
+                        self.index[term] = defaultdict(int, filtered_docs)
+                        self.vocabulary.add(term)
+        
+        # Jika vocabulary masih kosong, rebuild dari dokumen
+        if not self.vocabulary and self.documents:
             for doc_id, doc_content in self.documents.items():
-                self.add_document(doc_id, doc_content)
+                tokens = preprocess_text(doc_content)
+                tf_dict = defaultdict(int)
+                for token in tokens:
+                    tf_dict[token] += 1
+                for token, freq in tf_dict.items():
+                    self.index[token][doc_id] = freq
+                    self.vocabulary.add(token)
+        
+        # Load doc vectors jika ada
         if os.path.exists(DOC_VECTORS_FILE):
             with open(DOC_VECTORS_FILE, 'r', encoding='utf-8') as f:
                 vectors = json.load(f)
-                self.doc_vectors = {int(k): v for k, v in vectors.items()}
-        else:
-            if self.documents:
-                self.calculate_tfidf_vectors()
-        try:
-            if not os.path.exists(INVERTED_INDEX_FILE) or not os.path.exists(DOC_VECTORS_FILE):
-                self.save_to_disk()
-        except Exception:
-            pass
+                self.doc_vectors = {int(k): v for k, v in vectors.items() if int(k) in self.documents}
+        
+        # Hitung ulang vectors jika kosong
+        if not self.doc_vectors and self.documents:
+            self.calculate_tfidf_vectors()
+        
+        # Jika tidak ada files, rebuild semuanya dari dokumen
+        if (not os.path.exists(INVERTED_INDEX_FILE) or not os.path.exists(DOC_VECTORS_FILE)) and self.documents:
+            self.save_to_disk()
 
 
 # ==================== SIMILARITY ====================
@@ -170,21 +215,33 @@ def retrieve_documents(query: str, ir_index: InvertedIndex, top_k: int = 10) -> 
     query_tokens = preprocess_text(query)
     if not query_tokens:
         return []
+    
+    # Hitung term frequency dan unique terms
     query_tf = defaultdict(int)
     for token in query_tokens:
         query_tf[token] += 1
+    
     idf = ir_index.calculate_idf()
     query_vector = {}
-    for term in ir_index.vocabulary:
-        if term in query_tf:
+    
+    # Build query vector hanya untuk terms yang ada di query
+    for term in query_tf:
+        if term in ir_index.vocabulary:
             tf = 1 + math.log10(query_tf[term])
             query_vector[term] = tf * idf[term]
-        else:
-            query_vector[term] = 0
+    
+    # Normalisasi query vector
+    query_vector = normalize_vector(query_vector)
+    
     scores = []
     for doc_id, doc_vector in ir_index.doc_vectors.items():
-        sim = cosine_similarity_custom(query_vector, doc_vector)
-        scores.append((doc_id, ir_index.documents[doc_id], sim))
+        # Normalisasi doc vector
+        normalized_doc = normalize_vector(doc_vector)
+        # Hitung similarity hanya untuk terms yang ada
+        sim = sum(query_vector.get(t, 0) * normalized_doc.get(t, 0) for t in query_vector)
+        if sim > 0:  # Hanya include hasil dengan score > 0
+            scores.append((doc_id, ir_index.documents[doc_id], sim))
+    
     scores.sort(key=lambda x: x[2], reverse=True)
     return scores[:top_k]
 
@@ -194,9 +251,34 @@ def retrieve_documents(query: str, ir_index: InvertedIndex, top_k: int = 10) -> 
 def get_index():
     idx = InvertedIndex()
     idx.load_from_disk()
+    # Pastikan vocabulary dan vectors ter-rebuild
+    if idx.documents and not idx.vocabulary:
+        for doc_id, doc_content in idx.documents.items():
+            tokens = preprocess_text(doc_content)
+            tf_dict = defaultdict(int)
+            for token in tokens:
+                tf_dict[token] += 1
+            for token, freq in tf_dict.items():
+                idx.index[token][doc_id] = freq
+                idx.vocabulary.add(token)
     if idx.documents:
         idx.calculate_tfidf_vectors()
     return idx
+
+# Clear cache on session end
+def clear_cache_on_exit():
+    try:
+        ir_index = get_index()
+        ir_index.documents.clear()
+        ir_index.index.clear()
+        ir_index.doc_vectors.clear()
+        ir_index.vocabulary.clear()
+        # Kosongkan file penyimpanan
+        for f in [DOCUMENTS_FILE, INVERTED_INDEX_FILE, DOC_VECTORS_FILE]:
+            if os.path.exists(f):
+                os.remove(f)
+    except:
+        pass
 
 
 # ==================== STREAMLIT UI ====================
@@ -214,6 +296,9 @@ if not SASTRAWI_AVAILABLE:
 
 ir_index = get_index()
 
+# Register cleanup pada exit
+atexit.register(clear_cache_on_exit)
+
 # ==================== SIDEBAR ====================
 with st.sidebar:
     st.header("📊 Statistik Index")
@@ -229,6 +314,7 @@ with st.sidebar:
     col2.metric("Avg terms/dok", avg_terms)
 
     st.divider()
+    st.caption(f"💾 Cache: Max **{MAX_CACHED_DOCUMENTS}** dokumen/sesi")
     st.caption("IR Engine v1.0 · Streamlit UI")
 
 # ==================== TABS ====================
@@ -258,7 +344,40 @@ with tab_search:
                 relevant = [(doc_id, content, score) for doc_id, content, score in results if score > 0]
 
             if not relevant:
-                st.error("Tidak ada dokumen relevan ditemukan.")
+                st.error("❌ Tidak ada dokumen relevan ditemukan.")
+                
+                # DEBUG: Tampilkan informasi debugging
+                with st.expander("🔧 Debug Info"):
+                    q_tokens = preprocess_text(query)
+                    st.write(f"**Raw query:** `{query}`")
+                    st.write(f"**Query tokens setelah preprocessing:** {q_tokens if q_tokens else '(kosong)'}")
+                    
+                    # Cek term matching
+                    if q_tokens:
+                        matching_terms = [t for t in q_tokens if t in ir_index.vocabulary]
+                        st.write(f"**Term di vocabulary:** {matching_terms if matching_terms else '(tidak ada)'}")
+                        st.write(f"**Vocabulary size:** {len(ir_index.vocabulary)}")
+                        st.write(f"**Total dokumen:** {n_docs}")
+                        
+                        # PENTING: Tampilkan sample vocabulary untuk diagnostik
+                        st.write("**📌 Sample vocabulary (20 terms pertama):**")
+                        sample_vocab = sorted(ir_index.vocabulary)[:20]
+                        st.write(f"`{' | '.join(sample_vocab)}`")
+                        
+                        # Tampilkan sample dokumen
+                        if ir_index.documents:
+                            first_doc_id = min(ir_index.documents.keys())
+                            first_content = ir_index.documents[first_doc_id][:200]
+                            st.write(f"**📄 Sample dokumen (No. {first_doc_id + 1}):**")
+                            st.write(f"`{first_content}…`")
+                        
+                        # Tampilkan similarity scores untuk semua dokumen
+                        all_results = retrieve_documents(query, ir_index, top_k=n_docs)
+                        if all_results:
+                            st.write("**Similarity scores (semua dokumen):**")
+                            for doc_id, content, score in all_results[:10]:
+                                preview = (content[:100] + "…") if len(content) > 100 else content
+                                st.write(f"  - No. {doc_id + 1}: {score:.6f} | {preview}")
             else:
                 st.success(f"Ditemukan **{len(relevant)}** dokumen relevan")
 
@@ -268,12 +387,55 @@ with tab_search:
 
                 st.divider()
                 for rank, (doc_id, content, score) in enumerate(relevant, 1):
+                    # Debug: tampilkan term query yang ikut membentuk skor (agar jelas kenapa similarity bisa lebih besar)
+                    # Ini membantu validasi khususnya kasus kata seperti "modern" hanya muncul 1 kali.
+                    # Hanya tampil jika query lebih dari 0 term setelah preprocessing.
+
                     with st.container():
                         c1, c2 = st.columns([6, 1])
                         with c1:
-                            st.markdown(f"**#{rank} — Dokumen {doc_id}**")
+                            st.markdown(f"**#{rank} — Dokumen {doc_id + 1}** (Similarity: {score:.4f})")
                             preview = content if len(content) <= 300 else content[:300] + "…"
-                            st.write(preview)
+                            
+                            # Highlight query terms dalam preview (tanpa emote)
+                            # Catatan: preview adalah teks mentah; agar konsisten dengan query yang sudah dipreprocess,
+                            # kita tokenisasi preview lalu membandingkan token hasil preprocessing.
+                            def highlight_preview(raw_text: str, query_tokens_pre: list[str]) -> str:
+                                if not raw_text:
+                                    return raw_text
+                                if not query_tokens_pre:
+                                    return raw_text
+
+                                query_token_set = set(query_tokens_pre)
+
+                                # split token dengan regex agar kata/non-kata tetap terbaca
+                                # (gunakan \W+ yang benar, bukan \\W+ literal)
+                                parts = re.split(r"(\W+)", raw_text)
+
+                                out_parts = []
+                                for p in parts:
+                                    if not p:
+                                        continue
+                                    # hanya highlight untuk segmen yang berupa "kata" (mengandung huruf/angka)
+                                    if re.fullmatch(r"\w+", p, flags=re.UNICODE):
+                                        # preprocess token p dengan pipeline yang sama seperti query
+                                        pp = preprocess_text(p)
+                                        # preprocess_text bisa menghasilkan beberapa token; highlight bila ada yang match
+                                        if any(t in query_token_set for t in pp):
+                                            out_parts.append(f"**{p}**")
+                                        else:
+                                            out_parts.append(p)
+
+                                    else:
+                                        out_parts.append(p)
+                                return "".join(out_parts)
+
+                            # Highlight kata yang mirip dengan keyword query (tebal) — tanpa emote
+                            st.markdown(highlight_preview(preview, q_tokens))
+
+                            # Tambahan: jika dokumen hasil memiliki score sangat tinggi (mis. 1.0),
+                            # tetap pastikan kata yang mirip ditampilkan tebal. (highlight_preview sudah konsisten)
+
                         with c2:
                             st.metric("Skor", f"{score:.4f}")
                         st.divider()
@@ -297,7 +459,7 @@ with tab_add:
             ir_index.add_document(doc_id, doc_content.strip())
             ir_index.calculate_tfidf_vectors()
             ir_index.save_to_disk()
-            st.success(f"✅ Dokumen **{doc_id}** berhasil ditambahkan!")
+            st.success(f"✅ Dokumen **{doc_id + 1}** berhasil ditambahkan!")
             tokens = preprocess_text(doc_content)
             st.caption(f"Token hasil preprocessing: `{' | '.join(tokens)}`")
             st.rerun()
@@ -305,42 +467,81 @@ with tab_add:
     if ir_index.documents:
         st.divider()
         st.subheader("Daftar Dokumen Tersimpan")
-        rows = [{"ID": doc_id, "Preview": (content[:120] + "…") if len(content) > 120 else content}
-                for doc_id, content in ir_index.documents.items()]
+        # Hanya tampilkan 50 dokumen yang aktif
+        active_docs = dict(sorted(ir_index.documents.items()))
+        rows = [{"No": doc_id + 1, "Preview": (content[:120] + "…") if len(content) > 120 else content}
+                for doc_id, content in list(active_docs.items())[-50:]]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption(f"Menampilkan {len(rows)} dari {len(ir_index.documents)} dokumen aktif")
 
 
 # ==================== TAB: IMPORT EXCEL ====================
 with tab_excel:
     st.subheader("Import Dokumen dari Excel")
-    st.info("Upload file Excel hasil preprocessing. Kolom yang dibaca: **Token Setelah Stemming (Preprocessing Output)**")
+    st.info("Upload file Excel hasil preprocessing. Bisa import dari beberapa sheet sekaligus dalam 1 file.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🗑️ Kosongkan Index", type="secondary", use_container_width=True):
+            ir_index.clear_index()
+            ir_index.save_to_disk()
+            st.success("✅ Index kosong! Semua dokumen dan postings dihapus.")
+            st.rerun()
+    with col2:
+        st.write("")  # Spacing
 
     uploaded = st.file_uploader("Upload file Excel (.xlsx)", type=["xlsx"])
 
     if uploaded:
         try:
             xl = pd.ExcelFile(uploaded)
-            sheet = st.selectbox("Pilih sheet", xl.sheet_names)
-            df_raw = pd.read_excel(uploaded, sheet_name=sheet, skiprows=1)
+            st.write(f"**{len(xl.sheet_names)} sheet** ditemukan: {', '.join(str(s) for s in xl.sheet_names)}")
+            
+            # Auto-detect yang sheet paling cocok untuk dokumen
+            preferred_sheets = [s for s in xl.sheet_names if 'stemming' in s.lower() or 'asli' in s.lower()]
+            default_sheet_list = preferred_sheets if preferred_sheets else xl.sheet_names
+            
+            # Multi-select sheets
+            selected_sheets = st.multiselect(
+                "Pilih sheet yang ingin di-import",
+                xl.sheet_names,
+                default=default_sheet_list if len(default_sheet_list) <= 5 else default_sheet_list[:1]
+            )
+            
+            if selected_sheets:
+                # Pilih kolom (sama untuk semua sheet)
+                first_df = pd.read_excel(uploaded, sheet_name=selected_sheets[0], skiprows=1)
+                col_options = first_df.columns.tolist()
+                # Auto-detect kolom: cari "Teks Asli" atau "asli" atau "original"
+                default_col = next((c for c in col_options if any(kw in c.lower() for kw in ['asli', 'original', 'teks'])), col_options[0] if col_options else None)
+                selected_col = st.selectbox("Pilih kolom dokumen", col_options, index=col_options.index(default_col) if default_col else 0)
+                
+                # Preview
+                all_docs = []
+                for sheet_name in selected_sheets:
+                    df = pd.read_excel(uploaded, sheet_name=sheet_name, skiprows=1)
+                    if selected_col in df.columns:
+                        docs = df[selected_col].dropna().astype(str).tolist()
+                        all_docs.extend(docs)
+                
+                st.write(f"**Total {len(all_docs)} dokumen** dari {len(selected_sheets)} sheet. Preview 5 dokumen pertama:")
+                st.dataframe(pd.DataFrame({"Dokumen": all_docs[:5]}), hide_index=True, use_container_width=True)
+                
+                if st.button("📥 Import Semua ke Index", type="primary"):
+                    with st.spinner(f"Mengindex {len(all_docs)} dokumen dari {len(selected_sheets)} sheet…"):
+                        # Clear index terlebih dahulu
+                        ir_index.clear_index()
+                        # Import dokumen baru (max 50)
+                        # Pakai doc_id berurutan mulai dari 0 agar konsisten dengan urutan di dokumen.
+                        docs_to_import = all_docs[:MAX_CACHED_DOCUMENTS]
+                        for i, content in enumerate(docs_to_import):
+                            clean = content.replace(' | ', ' ').strip()
+                            ir_index.add_document(i, clean)
 
-            col_options = df_raw.columns.tolist()
-            default_col = next((c for c in col_options if 'stemming' in c.lower() or 'token' in c.lower()), col_options[0])
-            selected_col = st.selectbox("Pilih kolom dokumen", col_options, index=col_options.index(default_col))
-
-            docs_preview = df_raw[selected_col].dropna().astype(str).tolist()
-            st.write(f"**{len(docs_preview)} dokumen** ditemukan. Preview:")
-            st.dataframe(pd.DataFrame({"Dokumen": docs_preview[:5]}), hide_index=True, use_container_width=True)
-
-            if st.button("📥 Import ke Index", type="primary"):
-                with st.spinner(f"Mengindex {len(docs_preview)} dokumen…"):
-                    start_id = len(ir_index.documents)
-                    for i, content in enumerate(docs_preview):
-                        clean = content.replace(' | ', ' ').strip()
-                        ir_index.add_document(start_id + i, clean)
-                    ir_index.calculate_tfidf_vectors()
-                    ir_index.save_to_disk()
-                st.success(f"✅ {len(docs_preview)} dokumen berhasil diimport!")
-                st.rerun()
+                        ir_index.calculate_tfidf_vectors()
+                        ir_index.save_to_disk()
+                    st.success(f"✅ {len(docs_to_import)} dari {len(all_docs)} dokumen berhasil diimport ke Index (max 50 per sesi)!")
+                    st.rerun()
         except Exception as e:
             st.error(f"Gagal membaca file: {e}")
 
@@ -365,7 +566,7 @@ with tab_index:
             rows.append({
                 "Term": term,
                 "DF (jumlah dokumen)": len(postings),
-                "Posting List (doc_id: tf)": ", ".join(f"D{d}:{f}" for d, f in sorted(postings.items()))
+                "Posting List (No: tf)": ", ".join(f"No.{d+1}:{f}" for d, f in sorted(postings.items()))
             })
 
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -405,7 +606,7 @@ with tab_heatmap:
                         row.append(round(sim, 4))
                     sim_matrix.append(row)
 
-                labels = [f"D{i}" for i in doc_ids]
+                labels = [f"No.{i+1}" for i in doc_ids]
                 df_sim = pd.DataFrame(sim_matrix, index=labels, columns=labels)
 
                 fig, ax = plt.subplots(figsize=(max(8, max_show * 0.6), max(6, max_show * 0.5)))
