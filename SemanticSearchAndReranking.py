@@ -597,8 +597,7 @@ def run_streamlit() -> None:
 
     with st.sidebar:
         st.header("📁 Unggah Dokumen")
-        st.markdown("Gunakan upload file untuk menambah koleksi dokumen.")
-        uploaded_file = st.file_uploader("📄 Unggah dokumen", type=["csv", "xlsx"])
+        uploaded_file = st.file_uploader("Unggah dokumen", type=["csv", "xlsx"])
         st.markdown("---")
         st.markdown("**Tips:** gunakan file Excel dengan kolom teks berisi isi dokumen kata.")
 
@@ -653,7 +652,7 @@ def run_streamlit() -> None:
         for item in results:  # type: ignore
             st.markdown(
                 f"<div class='result-card'>"
-                f"<div class='result-source'>📘 {item['source']}</div>"
+                f"<div class='result-source'> {item['source']}</div>"
                 f"{build_score_badge(float(item['score']))}"
                 f"<div class='result-snippet'>{item['highlighted_snippet']}</div>"
                 f"</div>",
