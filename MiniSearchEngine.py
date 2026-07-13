@@ -5,7 +5,9 @@ import logging
 import math
 import re
 import os
+import sqlite3
 from pathlib import Path
+
 from collections import defaultdict
 from typing import Dict, List, Tuple, Set
 
@@ -28,9 +30,13 @@ COLUMN_NAME = 'Token Setelah Stemming (Preprocessing Output)'
 
 OUTPUT_VSM_EXCEL = 'hasil_vector_space_model.xlsx'
 OUTPUT_HEATMAP = 'similarity_heatmap.png'
+INDEX_DB_FILE = "ir_index.sqlite"
+
+# Legacy JSON files (migration only)
 DOCUMENTS_FILE = "documents.json"
 INVERTED_INDEX_FILE = "inverted_index.json"
 DOC_VECTORS_FILE = "doc_vectors.json"
+
 
 # Stop words bahasa Indonesia
 INDONESIAN_STOPWORDS = {
@@ -155,66 +161,178 @@ class InvertedIndex:
         """Return inverted index sebagai dictionary"""
         return {term: dict(docs) for term, docs in self.index.items()}
     
-    def save_to_disk(self):
-        """Simpan ke disk"""
-        with open(DOCUMENTS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(self.documents, f, ensure_ascii=False, indent=2)
-        
-        with open(INVERTED_INDEX_FILE, 'w', encoding='utf-8') as f:
-            json.dump(self.get_inverted_index_dict(), f, ensure_ascii=False, indent=2)
-        
-        with open(DOC_VECTORS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(self.doc_vectors, f, ensure_ascii=False, indent=2)
-    
-    def load_from_disk(self):
-        """Load dari disk.
+    def _init_db(self, conn: sqlite3.Connection) -> None:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                doc_id INTEGER PRIMARY KEY,
+                content TEXT NOT NULL
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS postings (
+                term TEXT NOT NULL,
+                doc_id INTEGER NOT NULL,
+                tf INTEGER NOT NULL,
+                PRIMARY KEY (term, doc_id)
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS vectors (
+                doc_id INTEGER NOT NULL,
+                term TEXT NOT NULL,
+                value REAL NOT NULL,
+                PRIMARY KEY (doc_id, term)
+            );
+        """)
+        conn.commit()
 
-        Robust terhadap kondisi parsial: documents.json ada tapi inverted_index.json/doc_vectors.json belum ada.
-        Jika index/vectors tidak tersedia, index dibangun ulang dari dokumen.
-        """
+    def _maybe_migrate_legacy_json_once(self, conn: sqlite3.Connection) -> None:
+        """Jika DB kosong tapi JSON legacy ada, import sekali."""
+        # DB file mungkin sudah tercipta oleh sqlite3.connect, jadi jangan check os.path.exists(INDEX_DB_FILE)
         if not os.path.exists(DOCUMENTS_FILE):
             return
 
-        # 1) Load dokumen
+
+        # Pastikan schema ada
+        self._init_db(conn)
+
+        # Load dari JSON legacy
         with open(DOCUMENTS_FILE, 'r', encoding='utf-8') as f:
             self.documents = {int(k): v for k, v in json.load(f).items()}
 
-        # 2) Load inverted index bila tersedia
         if os.path.exists(INVERTED_INDEX_FILE):
             with open(INVERTED_INDEX_FILE, 'r', encoding='utf-8') as f:
                 index_dict = json.load(f)
-                for term, docs in index_dict.items():
-                    self.index[term] = defaultdict(int, {int(k): v for k, v in docs.items()})
-                    self.vocabulary.add(term)
+            self.index = defaultdict(lambda: defaultdict(int))
+            self.vocabulary = set()
+            for term, docs in index_dict.items():
+                for k, v in docs.items():
+                    doc_id = int(k)
+                    self.index[term][doc_id] = int(v)
+                self.vocabulary.add(term)
         else:
-            # rebuild index dari dokumen
             self.index = defaultdict(lambda: defaultdict(int))
             self.vocabulary = set()
             for doc_id, doc_content in self.documents.items():
                 self.add_document(doc_id, doc_content)
 
-        # 3) Load doc vectors bila tersedia, bila tidak rebuild
         if os.path.exists(DOC_VECTORS_FILE):
             with open(DOC_VECTORS_FILE, 'r', encoding='utf-8') as f:
                 vectors = json.load(f)
-                self.doc_vectors = {int(k): v for k, v in vectors.items()}
+            self.doc_vectors = {int(k): v for k, v in vectors.items()}
         else:
-            # memastikan tf-idf tersedia untuk retrieval
-            if not self.vocabulary and self.documents:
-                # safety net, rebuild vocabulary+index
-                self.index = defaultdict(lambda: defaultdict(int))
-                self.vocabulary = set()
-                for doc_id, doc_content in self.documents.items():
-                    self.add_document(doc_id, doc_content)
+            self.calculate_tfidf_vectors()
 
-            if self.documents:
+        # Simpan ke SQLite
+        self.save_to_disk()
+
+    def save_to_disk(self) -> None:
+        """Simpan ke disk menggunakan SQLite (tanpa JSON runtime)."""
+        # Jika masih tidak ada dokumen, jangan bikin DB kosong
+        if not self.documents:
+            # tetap buat DB kosong agar load_from_disk tidak ambigu
+            conn = sqlite3.connect(INDEX_DB_FILE)
+            try:
+                self._init_db(conn)
+            finally:
+                conn.close()
+            return
+
+        conn = sqlite3.connect(INDEX_DB_FILE)
+        try:
+            self._init_db(conn)
+            cur = conn.cursor()
+            cur.execute("DELETE FROM documents")
+            cur.execute("DELETE FROM postings")
+            cur.execute("DELETE FROM vectors")
+
+            # documents
+            cur.executemany(
+                "INSERT INTO documents (doc_id, content) VALUES (?, ?)",
+                [(int(doc_id), content) for doc_id, content in self.documents.items()],
+            )
+
+            # postings
+            postings_rows = []
+            for term, docs in self.index.items():
+                for doc_id, tf in docs.items():
+                    postings_rows.append((term, int(doc_id), int(tf)))
+            if postings_rows:
+                cur.executemany(
+                    "INSERT INTO postings (term, doc_id, tf) VALUES (?, ?, ?)",
+                    postings_rows,
+                )
+
+            # vectors
+            vectors_rows = []
+            for doc_id, vec in self.doc_vectors.items():
+                for term, value in vec.items():
+                    vectors_rows.append((int(doc_id), term, float(value)))
+            if vectors_rows:
+                cur.executemany(
+                    "INSERT INTO vectors (doc_id, term, value) VALUES (?, ?, ?)",
+                    vectors_rows,
+                )
+
+            conn.commit()
+        finally:
+            conn.close()
+
+    def load_from_disk(self) -> None:
+        """Load dari disk menggunakan SQLite.
+
+        Migration: jika DB belum ada tapi JSON legacy ada, lakukan import sekali.
+        Setelah itu aplikasi tidak lagi bergantung pada JSON.
+        """
+        # Pastikan database ada / siap
+        db_exists = os.path.exists(INDEX_DB_FILE)
+        conn = sqlite3.connect(INDEX_DB_FILE)
+        try:
+            self._init_db(conn)
+
+            # Migration dilakukan jika DB kosong (tanpa mengandalkan keberadaan file sebelumnya)
+            cur0 = conn.cursor()
+            cur0.execute("SELECT COUNT(*) FROM documents")
+            doc_count = cur0.fetchone()[0]
+
+            if doc_count == 0 and (not self.documents):
+                self._maybe_migrate_legacy_json_once(conn)
+
+
+            cur = conn.cursor()
+            cur.execute("SELECT doc_id, content FROM documents")
+            rows = cur.fetchall()
+            if not rows:
+                return
+
+            self.documents = {int(doc_id): content for doc_id, content in rows}
+            self.index = defaultdict(lambda: defaultdict(int))
+            self.vocabulary = set()
+            self.doc_vectors = {}
+
+            # postings
+            cur.execute("SELECT term, doc_id, tf FROM postings")
+            postings_rows = cur.fetchall()
+            for term, doc_id, tf in postings_rows:
+                doc_id = int(doc_id)
+                self.index[term][doc_id] = int(tf)
+                self.vocabulary.add(term)
+
+            # vectors
+            cur.execute("SELECT doc_id, term, value FROM vectors")
+            vec_rows = cur.fetchall()
+            for doc_id, term, value in vec_rows:
+                doc_id = int(doc_id)
+                self.doc_vectors.setdefault(doc_id, {})[term] = float(value)
+
+            # Safety: jika vectors kosong, hitung ulang
+            if self.documents and (not self.doc_vectors):
                 self.calculate_tfidf_vectors()
 
-        # 4) Jika terjadi rebuild sebagian (index/vectors hilang), persist agar next run cepat
-        #    (tanpa menambah overhead besar)
-        # persist bila index/vectors hilang
-        if (not os.path.exists(INVERTED_INDEX_FILE)) or (not os.path.exists(DOC_VECTORS_FILE)):
-            self.save_to_disk()
+        finally:
+            conn.close()
+
 
 
 

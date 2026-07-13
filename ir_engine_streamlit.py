@@ -4,6 +4,8 @@ import math
 import re
 import os
 import atexit
+import sqlite3
+
 from collections import defaultdict
 from typing import Dict, List, Tuple, Set
 
@@ -26,10 +28,15 @@ except ImportError:
     SASTRAWI_AVAILABLE = False
 
 # ==================== KONFIGURASI ====================
+INDEX_DB_FILE = "ir_index.sqlite"
+
+# Legacy JSON files (migration only)
 DOCUMENTS_FILE = "documents.json"
 INVERTED_INDEX_FILE = "inverted_index.json"
 DOC_VECTORS_FILE = "doc_vectors.json"
+
 MAX_CACHED_DOCUMENTS = 50  # Maksimal dokumen yang disimpan
+
 
 INDONESIAN_STOPWORDS = {
     'yang', 'dan', 'di', 'dari', 'ke', 'adalah', 'ini', 'itu', 'atau', 'tidak',
@@ -133,13 +140,108 @@ class InvertedIndex:
     def get_inverted_index_dict(self) -> Dict:
         return {term: dict(docs) for term, docs in self.index.items()}
 
+    def _init_db(self, conn: sqlite3.Connection) -> None:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                doc_id INTEGER PRIMARY KEY,
+                content TEXT NOT NULL
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS postings (
+                term TEXT NOT NULL,
+                doc_id INTEGER NOT NULL,
+                tf INTEGER NOT NULL,
+                PRIMARY KEY (term, doc_id)
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS vectors (
+                doc_id INTEGER NOT NULL,
+                term TEXT NOT NULL,
+                value REAL NOT NULL,
+                PRIMARY KEY (doc_id, term)
+            );
+        """)
+        conn.commit()
+
+    def _maybe_migrate_legacy_json_once(self, conn: sqlite3.Connection) -> None:
+        """Jika DB belum ada tapi JSON legacy ada, import sekali."""
+        if os.path.exists(INDEX_DB_FILE):
+            return
+        if not os.path.exists(DOCUMENTS_FILE):
+            return
+
+        self._init_db(conn)
+
+        with open(DOCUMENTS_FILE, 'r', encoding='utf-8') as f:
+            self.documents = {int(k): v for k, v in json.load(f).items()}
+
+        if os.path.exists(INVERTED_INDEX_FILE):
+            with open(INVERTED_INDEX_FILE, 'r', encoding='utf-8') as f:
+                index_dict = json.load(f)
+            self.index = defaultdict(lambda: defaultdict(int))
+            self.vocabulary = set()
+            for term, docs in index_dict.items():
+                for k, v in docs.items():
+                    doc_id = int(k)
+                    self.index[term][doc_id] = int(v)
+                self.vocabulary.add(term)
+        else:
+            self.index = defaultdict(lambda: defaultdict(int))
+            self.vocabulary = set()
+            for doc_id, doc_content in self.documents.items():
+                self.add_document(doc_id, doc_content)
+
+        if os.path.exists(DOC_VECTORS_FILE):
+            with open(DOC_VECTORS_FILE, 'r', encoding='utf-8') as f:
+                vectors = json.load(f)
+            self.doc_vectors = {int(k): v for k, v in vectors.items()}
+        else:
+            self.calculate_tfidf_vectors()
+
+        self.save_to_disk()
+
     def save_to_disk(self):
-        with open(DOCUMENTS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(self.documents, f, ensure_ascii=False, indent=2)
-        with open(INVERTED_INDEX_FILE, 'w', encoding='utf-8') as f:
-            json.dump(self.get_inverted_index_dict(), f, ensure_ascii=False, indent=2)
-        with open(DOC_VECTORS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(self.doc_vectors, f, ensure_ascii=False, indent=2)
+        """Simpan ke disk menggunakan SQLite (tanpa JSON runtime)."""
+        conn = sqlite3.connect(INDEX_DB_FILE)
+        try:
+            self._init_db(conn)
+            cur = conn.cursor()
+            cur.execute("DELETE FROM documents")
+            cur.execute("DELETE FROM postings")
+            cur.execute("DELETE FROM vectors")
+
+            cur.executemany(
+                "INSERT INTO documents (doc_id, content) VALUES (?, ?)",
+                [(int(doc_id), content) for doc_id, content in self.documents.items()],
+            )
+
+            postings_rows = []
+            for term, docs in self.index.items():
+                for doc_id, tf in docs.items():
+                    postings_rows.append((term, int(doc_id), int(tf)))
+            if postings_rows:
+                cur.executemany(
+                    "INSERT INTO postings (term, doc_id, tf) VALUES (?, ?, ?)",
+                    postings_rows,
+                )
+
+            vectors_rows = []
+            for doc_id, vec in self.doc_vectors.items():
+                for term, value in vec.items():
+                    vectors_rows.append((int(doc_id), term, float(value)))
+            if vectors_rows:
+                cur.executemany(
+                    "INSERT INTO vectors (doc_id, term, value) VALUES (?, ?, ?)",
+                    vectors_rows,
+                )
+
+            conn.commit()
+        finally:
+            conn.close()
+
 
     def clear_index(self):
         """Kosongkan semua dokumen dan index"""
@@ -150,53 +252,66 @@ class InvertedIndex:
         self.doc_id_counter = 0
 
     def load_from_disk(self):
-        if not os.path.exists(DOCUMENTS_FILE):
-            return
-        with open(DOCUMENTS_FILE, 'r', encoding='utf-8') as f:
-            all_docs = {int(k): v for k, v in json.load(f).items()}
-        
-        # Hanya load 50 dokumen terakhir (berdasarkan ID)
-        if len(all_docs) > MAX_CACHED_DOCUMENTS:
-            sorted_ids = sorted(all_docs.keys(), reverse=True)[:MAX_CACHED_DOCUMENTS]
-            self.documents = {doc_id: all_docs[doc_id] for doc_id in sorted_ids}
-        else:
-            self.documents = all_docs
-        
-        # Load index jika ada
-        if os.path.exists(INVERTED_INDEX_FILE):
-            with open(INVERTED_INDEX_FILE, 'r', encoding='utf-8') as f:
-                index_dict = json.load(f)
-                for term, docs in index_dict.items():
-                    # Filter hanya dokumen yang di-load
-                    filtered_docs = {int(k): v for k, v in docs.items() if int(k) in self.documents}
-                    if filtered_docs:
-                        self.index[term] = defaultdict(int, filtered_docs)
-                        self.vocabulary.add(term)
-        
-        # Jika vocabulary masih kosong, rebuild dari dokumen
-        if not self.vocabulary and self.documents:
-            for doc_id, doc_content in self.documents.items():
-                tokens = preprocess_text(doc_content)
-                tf_dict = defaultdict(int)
-                for token in tokens:
-                    tf_dict[token] += 1
-                for token, freq in tf_dict.items():
-                    self.index[token][doc_id] = freq
-                    self.vocabulary.add(token)
-        
-        # Load doc vectors jika ada
-        if os.path.exists(DOC_VECTORS_FILE):
-            with open(DOC_VECTORS_FILE, 'r', encoding='utf-8') as f:
-                vectors = json.load(f)
-                self.doc_vectors = {int(k): v for k, v in vectors.items() if int(k) in self.documents}
-        
-        # Hitung ulang vectors jika kosong
-        if not self.doc_vectors and self.documents:
-            self.calculate_tfidf_vectors()
-        
-        # Jika tidak ada files, rebuild semuanya dari dokumen
-        if (not os.path.exists(INVERTED_INDEX_FILE) or not os.path.exists(DOC_VECTORS_FILE)) and self.documents:
-            self.save_to_disk()
+        """Load dari disk menggunakan SQLite.
+
+        Migration: jika DB belum ada tapi JSON legacy ada, lakukan import sekali.
+        Setelah itu aplikasi tidak lagi bergantung pada JSON.
+        """
+        db_exists = os.path.exists(INDEX_DB_FILE)
+        conn = sqlite3.connect(INDEX_DB_FILE)
+        try:
+            self._init_db(conn)
+
+            if not db_exists:
+                self._maybe_migrate_legacy_json_once(conn)
+
+            cur = conn.cursor()
+            cur.execute("SELECT doc_id, content FROM documents")
+            rows = cur.fetchall()
+            if not rows:
+                return
+
+            all_docs = {int(doc_id): content for doc_id, content in rows}
+
+            # enforce max cached docs (FIFO): ambil 50 dokumen terakhir
+            if len(all_docs) > MAX_CACHED_DOCUMENTS:
+                sorted_ids = sorted(all_docs.keys(), reverse=True)[:MAX_CACHED_DOCUMENTS]
+                self.documents = {doc_id: all_docs[doc_id] for doc_id in sorted_ids}
+            else:
+                self.documents = all_docs
+
+            self.index = defaultdict(lambda: defaultdict(int))
+            self.vocabulary = set()
+            self.doc_vectors = {}
+
+            # postings filter by loaded docs
+            loaded_doc_ids = set(self.documents.keys())
+            cur.execute("SELECT term, doc_id, tf FROM postings")
+            postings_rows = cur.fetchall()
+            for term, doc_id, tf in postings_rows:
+                doc_id = int(doc_id)
+                if doc_id in loaded_doc_ids:
+                    self.index[term][doc_id] = int(tf)
+                    self.vocabulary.add(term)
+
+            # vectors filter by loaded docs
+            cur.execute("SELECT doc_id, term, value FROM vectors")
+            vec_rows = cur.fetchall()
+            for doc_id, term, value in vec_rows:
+                doc_id = int(doc_id)
+                if doc_id in loaded_doc_ids:
+                    self.doc_vectors.setdefault(doc_id, {})[term] = float(value)
+
+            # Hitung ulang vectors jika kosong
+            if self.documents and (not self.doc_vectors):
+                self.calculate_tfidf_vectors()
+
+            # Persist agar DB konsisten dengan max cache
+            if len(self.documents) != len(all_docs):
+                self.save_to_disk()
+        finally:
+            conn.close()
+
 
 
 # ==================== SIMILARITY ====================
@@ -273,12 +388,10 @@ def clear_cache_on_exit():
         ir_index.index.clear()
         ir_index.doc_vectors.clear()
         ir_index.vocabulary.clear()
-        # Kosongkan file penyimpanan
-        for f in [DOCUMENTS_FILE, INVERTED_INDEX_FILE, DOC_VECTORS_FILE]:
-            if os.path.exists(f):
-                os.remove(f)
+        # Jangan hapus file persist normal (SQLite). Migration sudah menjaga runtime.
     except:
         pass
+
 
 
 # ==================== STREAMLIT UI ====================
@@ -400,7 +513,7 @@ with tab_search:
                             # Highlight query terms dalam preview (tanpa emote)
                             # Catatan: preview adalah teks mentah; agar konsisten dengan query yang sudah dipreprocess,
                             # kita tokenisasi preview lalu membandingkan token hasil preprocessing.
-                            def highlight_preview(raw_text: str, query_tokens_pre: list[str]) -> str:
+                            def highlight_preview(raw_text: str, query_tokens_pre: List[str]) -> str:
                                 if not raw_text:
                                     return raw_text
                                 if not query_tokens_pre:
